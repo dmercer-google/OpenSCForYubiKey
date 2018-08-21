@@ -29,6 +29,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <openssl/sha.h>
 #else
 #include <windows.h>
 #include <io.h>
@@ -331,6 +332,7 @@ static int		opt_derive_pass_der = 0;
 static unsigned long	opt_random_bytes = 0;
 static CK_MECHANISM_TYPE opt_hash_alg = 0;
 static unsigned long	opt_mgf = 0;
+static CK_BBOOL opt_use_yubikey = FALSE;
 static long	        salt_len = 0;
 static int		salt_len_given = 0; /* 0 - not given, 1 - given with input parameters */
 
@@ -777,6 +779,9 @@ int main(int argc, char * argv[])
 			break;
 		case OPT_MODULE:
 			opt_module = optarg;
+			if (strstr(optarg, "libykcs11.so") != NULL){
+			  opt_use_yubikey = TRUE;
+			}
 			break;
 		case OPT_APPLICATION_LABEL:
 			opt_application_label = optarg;
@@ -1662,10 +1667,182 @@ static unsigned long figure_pss_salt_length(const int hash) {
 	return sLen;
 }
 
+#define IN_BUFFER_SIZE 1025
+#define SIG_BUFFER_SIZE 512
+
+static void yubisign_fatal(const char *message, const char *func, int res)
+{
+  if (p11)
+    p11->C_Finalize(NULL_PTR);
+  if (module)
+    C_UnloadModule(module);
+
+  util_fatal("yubi_sign function %s failed: %s res = %d (0x%0x)", func, message, "", (unsigned int) res);
+}
+
+static void yubi_sign(CK_SESSION_HANDLE session, CK_OBJECT_HANDLE key, unsigned char *in_buffer, unsigned char *sig_buffer, CK_ULONG_PTR sig_len, int fd, int r) {
+  int res = 0;
+  unsigned char hashBuffer[SHA512_DIGEST_LENGTH];
+  memset(&hashBuffer, 0, sizeof(hashBuffer));
+  int hashLength = 0;
+
+  CK_MECHANISM mech;
+  memset(&mech, 0, sizeof(mech));
+  mech.mechanism = CKM_ECDSA;
+
+  SHA_CTX sha1;
+  SHA256_CTX sha224; // Yes, this is correct
+  SHA256_CTX sha256;
+  SHA512_CTX sha384; // Yes, this is correct
+  SHA512_CTX sha512;
+
+  switch (opt_mechanism) {
+    case CKM_ECDSA:
+      if (r != SHA_DIGEST_LENGTH
+          && r != SHA224_DIGEST_LENGTH
+          && r != SHA256_DIGEST_LENGTH
+          && r != SHA384_DIGEST_LENGTH
+          && r != SHA512_DIGEST_LENGTH) {
+        yubisign_fatal("Invalid digest length", "", -1);
+        hashLength = r;
+        memcpy(hashBuffer, in_buffer, r);
+      }
+      break;
+    case CKM_ECDSA_SHA1:
+      memset(&sha1, 0, sizeof(sha1));
+      if ((res = SHA1_Init(&sha1)) != 1)
+        yubisign_fatal("", "SHA1_Init", res);
+
+      if ((res = SHA1_Update(&sha1, in_buffer, r)) != 1)
+        yubisign_fatal("", "SHA1_Update", res);
+      if ((r = (int) sizeof(in_buffer))) {
+        while ((r = read(fd, in_buffer, sizeof(in_buffer))) > 0) {
+          if ((res = SHA1_Update(&sha1, in_buffer, r)) != 1)
+            yubisign_fatal("", "SHA1_Update", res);
+        }
+      }
+      if ((res = SHA1_Final(hashBuffer, &sha1)) != 1)
+        yubisign_fatal("", "SHA1_Final", res);
+      hashLength = SHA_DIGEST_LENGTH;
+      break;
+
+    case CKM_ECDSA_SHA224:
+      memset(&sha224, 0, sizeof(sha224));
+      res = SHA224_Init(&sha224);
+      if (res != 1)
+        yubisign_fatal("", "SHA224_Init", res);
+
+      res = SHA224_Update(&sha224, in_buffer, r);
+      if (res != 1)
+        yubisign_fatal("", "SHA224_Update", res);
+
+      if ((r = (int) sizeof(in_buffer))) {
+        while ((r = read(fd, in_buffer, sizeof(in_buffer))) > 0) {
+          res = SHA224_Update(&sha224, in_buffer, r);
+          if (res != 1) {
+            yubisign_fatal("", "SHA224_Update", res);
+          }
+        }
+      }
+      res = SHA224_Final(hashBuffer, &sha224);
+      if (res != 1) {
+        yubisign_fatal("", "SHA224_Final", res);
+      }
+      hashLength = SHA224_DIGEST_LENGTH;
+      break;
+
+    case CKM_ECDSA_SHA256:
+      memset(&sha256, 0, sizeof(sha256));
+      res = SHA256_Init(&sha256);
+      if (res != 1)
+        yubisign_fatal("", "SHA256_Init", res);
+
+      res = SHA256_Update(&sha256, in_buffer, r);
+      if (res != 1)
+        yubisign_fatal("", "SHA256_Update", res);
+
+      if ((r = (int) sizeof(in_buffer))) {
+        while ((r = read(fd, in_buffer, sizeof(in_buffer))) > 0) {
+          res = SHA256_Update(&sha256, in_buffer, r);
+          if (res != 1) {
+            yubisign_fatal("", "SHA256_Update", res);
+          }
+        }
+      }
+      res = SHA256_Final(hashBuffer, &sha256);
+      if (res != 1) {
+        yubisign_fatal("", "SHA256_Final", res);
+      }
+      hashLength = SHA256_DIGEST_LENGTH;
+      break;
+
+    case CKM_ECDSA_SHA384:
+      memset(&sha384, 0, sizeof(sha384));
+      res = SHA384_Init(&sha384);
+      if (res != 1)
+        yubisign_fatal("", "SHA384_Init", res);
+
+      res = SHA384_Update(&sha384, in_buffer, r);
+      if (res != 1)
+        yubisign_fatal("", "SHA384_Update", res);
+
+      if ((r = (int) sizeof(in_buffer))) {
+        while ((r = read(fd, in_buffer, sizeof(in_buffer))) > 0) {
+          res = SHA384_Update(&sha384, in_buffer, r);
+          if (res != 1) {
+            yubisign_fatal("", "SHA384_Update", res);
+          }
+        }
+      }
+      res = SHA384_Final(hashBuffer, &sha384);
+      if (res != 1) {
+        yubisign_fatal("", "SHA384_Final", res);
+      }
+      hashLength = SHA384_DIGEST_LENGTH;
+      break;
+
+    case CKM_ECDSA_SHA512:
+      memset(&sha512, 0, sizeof(sha512));
+      res = SHA512_Init(&sha512);
+      if (res != 1)
+        yubisign_fatal("", "SHA512_Init", res);
+
+      res = SHA512_Update(&sha512, in_buffer, r);
+      if (res != 1)
+        yubisign_fatal("", "SHA512_Update", res);
+
+      if ((r = (int) sizeof(in_buffer))) {
+        while ((r = read(fd, in_buffer, sizeof(in_buffer))) > 0) {
+          res = SHA512_Update(&sha512, in_buffer, r);
+          if (res != 1) {
+            yubisign_fatal("", "SHA512_Update", res);
+          }
+        }
+      }
+      res = SHA512_Final(hashBuffer, &sha512);
+      if (res != 1) {
+        yubisign_fatal("", "SHA512_Final", res);
+      }
+      hashLength = SHA512_DIGEST_LENGTH;
+      break;
+  }
+
+  res = p11->C_SignInit(session, &mech, key);
+  if (res != CKR_OK)
+    p11_fatal("C_SignInit", res);
+  if (getALWAYS_AUTHENTICATE(session, key))
+    login(session, CKU_CONTEXT_SPECIFIC);
+
+  *sig_len = SIG_BUFFER_SIZE;
+  res = p11->C_Sign(session, hashBuffer, hashLength, sig_buffer, sig_len);
+  if (res != CKR_OK)
+    p11_fatal("C_Sign", res);
+}
+
 static void sign_data(CK_SLOT_ID slot, CK_SESSION_HANDLE session,
 		CK_OBJECT_HANDLE key)
 {
-	unsigned char	in_buffer[1025], sig_buffer[512];
+	unsigned char	in_buffer[IN_BUFFER_SIZE], sig_buffer[SIG_BUFFER_SIZE];
 	CK_MECHANISM	mech;
 	CK_RSA_PKCS_PSS_PARAMS pss_params;
 	CK_RV		rv;
@@ -1790,39 +1967,47 @@ to zero, or equal to -1 (meaning: use digest size) or to -2 \
 	if (opt_mechanism == CKM_RSA_PKCS_PSS && (unsigned long)r != hashlen)
 		util_fatal("For %s mechanism, message size (got %d bytes) must be equal to specified digest length (%lu)\n",
 			p11_mechanism_to_name(opt_mechanism), r, hashlen);
+    if (opt_use_yubikey == TRUE
+        && (opt_mechanism == CKM_ECDSA
+            || opt_mechanism == CKM_ECDSA_SHA1
+            || opt_mechanism == CKM_ECDSA_SHA256
+            || opt_mechanism == CKM_ECDSA_SHA384
+            || opt_mechanism == CKM_ECDSA_SHA512)){
+      yubi_sign(session, key, in_buffer, sig_buffer, &sig_len, fd, r);
+    } else {
+      rv = CKR_CANCEL;
+      if (r < (int) sizeof(in_buffer)) {
+        rv = p11->C_SignInit(session, &mech, key);
+        if (rv != CKR_OK)
+          p11_fatal("C_SignInit", rv);
+        if (getALWAYS_AUTHENTICATE(session, key))
+          login(session, CKU_CONTEXT_SPECIFIC);
 
-	rv = CKR_CANCEL;
-	if (r < (int) sizeof(in_buffer))   {
-		rv = p11->C_SignInit(session, &mech, key);
-		if (rv != CKR_OK)
-			p11_fatal("C_SignInit", rv);
-		if (getALWAYS_AUTHENTICATE(session, key))
-			login(session,CKU_CONTEXT_SPECIFIC);
+        sig_len = sizeof(sig_buffer);
+        rv = p11->C_Sign(session, in_buffer, r, sig_buffer, &sig_len);
+      }
 
-		sig_len = sizeof(sig_buffer);
-		rv =  p11->C_Sign(session, in_buffer, r, sig_buffer, &sig_len);
-	}
+      if (rv != CKR_OK) {
+        rv = p11->C_SignInit(session, &mech, key);
+        if (rv != CKR_OK)
+          p11_fatal("C_SignInit", rv);
+        if (getALWAYS_AUTHENTICATE(session, key))
+          login(session, CKU_CONTEXT_SPECIFIC);
 
-	if (rv != CKR_OK)   {
-		rv = p11->C_SignInit(session, &mech, key);
-		if (rv != CKR_OK)
-			p11_fatal("C_SignInit", rv);
-		if (getALWAYS_AUTHENTICATE(session, key))
-			login(session,CKU_CONTEXT_SPECIFIC);
+        do {
+          rv = p11->C_SignUpdate(session, in_buffer, r);
+          if (rv != CKR_OK)
+            p11_fatal("C_SignUpdate", rv);
 
-		do   {
-			rv = p11->C_SignUpdate(session, in_buffer, r);
-			if (rv != CKR_OK)
-				p11_fatal("C_SignUpdate", rv);
+          r = read(fd, in_buffer, sizeof(in_buffer));
+        } while (r > 0);
 
-			r = read(fd, in_buffer, sizeof(in_buffer));
-		} while (r > 0);
-
-		sig_len = sizeof(sig_buffer);
-		rv = p11->C_SignFinal(session, sig_buffer, &sig_len);
-		if (rv != CKR_OK)
-			p11_fatal("C_SignFinal", rv);
-	}
+        sig_len = sizeof(sig_buffer);
+        rv = p11->C_SignFinal(session, sig_buffer, &sig_len);
+        if (rv != CKR_OK)
+          p11_fatal("C_SignFinal", rv);
+      }
+    }
 
 	if (fd != 0)
 		close(fd);
@@ -1833,7 +2018,12 @@ to zero, or equal to -1 (meaning: use digest size) or to -2 \
 		util_fatal("failed to open %s: %m", opt_output);
 	}
 
-	if (opt_mechanism == CKM_ECDSA || opt_mechanism == CKM_ECDSA_SHA1 || opt_mechanism == CKM_ECDSA_SHA256 || opt_mechanism == CKM_ECDSA_SHA384 || opt_mechanism == CKM_ECDSA_SHA512 || opt_mechanism == CKM_ECDSA_SHA224) {
+	if (opt_mechanism == CKM_ECDSA 
+        || opt_mechanism == CKM_ECDSA_SHA1 
+        || opt_mechanism == CKM_ECDSA_SHA256 
+        || opt_mechanism == CKM_ECDSA_SHA384 
+        || opt_mechanism == CKM_ECDSA_SHA512 
+        || opt_mechanism == CKM_ECDSA_SHA224) {
 		if (opt_sig_format &&  (!strcmp(opt_sig_format, "openssl") || !strcmp(opt_sig_format, "sequence"))) {
 			unsigned char *seq;
 			size_t seqlen;
@@ -1855,7 +2045,6 @@ to zero, or equal to -1 (meaning: use digest size) or to -2 \
 	if (fd != 1)
 		close(fd);
 }
-
 
 static void decrypt_data(CK_SLOT_ID slot, CK_SESSION_HANDLE session,
 		CK_OBJECT_HANDLE key)

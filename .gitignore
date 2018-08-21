@@ -1,3 +1,9 @@
+.idea/
+CMakeLists.txt
+MacOSX/resources/Welcome.html
+cmake-build-debug/
+test-driver
+
 Makefile
 Makefile.in
 core
